@@ -42,13 +42,11 @@
 #include <assert.h>
 #include "address.h"
 #include "listener.h"
-#include "connection.h"
 #include "logger.h"
 #include "binder.h"
 #include "protocol.h"
 #include "tls.h"
 #include "http.h"
-
 
 static void close_listener(struct ev_loop *, struct Listener *);
 static void accept_cb(struct ev_loop *, struct ev_io *, int);
@@ -56,7 +54,35 @@ static void backoff_timer_cb(struct ev_loop *, struct ev_timer *, int);
 static int init_listener(struct Listener *, const struct Table_head *, struct ev_loop *);
 static void listener_update(struct Listener *, struct Listener *,  const struct Table_head *);
 static void free_listener(struct Listener *);
+static int parse_boolean(const char *);
 
+
+static int
+parse_boolean(const char *boolean) {
+    const char *boolean_true[] = {
+        "yes",
+        "true",
+        "on",
+    };
+
+    const char *boolean_false[] = {
+        "no",
+        "false",
+        "off",
+    };
+
+    for (size_t i = 0; i < sizeof(boolean_true) / sizeof(boolean_true[0]); i++)
+        if (strcasecmp(boolean, boolean_true[i]) == 0)
+            return 1;
+
+    for (size_t i = 0; i < sizeof(boolean_false) / sizeof(boolean_false[0]); i++)
+        if (strcasecmp(boolean, boolean_false[i]) == 0)
+            return 0;
+
+    err("Unable to parse '%s' as a boolean value", boolean);
+
+    return -1;
+}
 
 /*
  * Initialize each listener.
@@ -102,6 +128,9 @@ listeners_reload(struct Listener_head *existing_listeners,
                     display_address(new_listener->address,
                             address, sizeof(address)));
 
+            /* Using SLIST_REMOVE rather than remove_listener to defer
+             * decrementing reference count until after adding to the running
+             * config */
             SLIST_REMOVE(new_listeners, new_listener, Listener, entries);
             add_listener(existing_listeners, new_listener);
             init_listener(new_listener, tables, loop);
@@ -125,11 +154,7 @@ listeners_reload(struct Listener_head *existing_listeners,
                     display_address(removed_listener->address,
                             address, sizeof(address)));
 
-            SLIST_REMOVE(existing_listeners, removed_listener, Listener, entries);
-            close_listener(loop, removed_listener);
-
-            /* -1 for removing from existing_listeners */
-            listener_ref_put(removed_listener);
+            remove_listener(existing_listeners, removed_listener, loop);
         }
     }
 }
@@ -191,6 +216,10 @@ new_listener() {
     listener->table_name = NULL;
     listener->access_log = NULL;
     listener->log_bad_requests = 0;
+    listener->reuseport = 0;
+    listener->ipv6_v6only = 0;
+    listener->transparent_proxy = 0;
+    listener->fallback_use_proxy_header = 0;
     listener->reference_count = 0;
     /* Initializes sock fd to negative sentinel value to indicate watchers
      * are not active */
@@ -202,7 +231,7 @@ new_listener() {
 }
 
 int
-accept_listener_arg(struct Listener *listener, char *arg) {
+accept_listener_arg(struct Listener *listener, const char *arg) {
     if (listener->address == NULL && !is_numeric(arg)) {
         listener->address = new_address(arg);
 
@@ -219,10 +248,15 @@ accept_listener_arg(struct Listener *listener, char *arg) {
             err("Unable to initialize default address");
             return -1;
         }
-
-        address_set_port(listener->address, atoi(arg));
+        if (!address_set_port_str(listener->address, arg)) {
+            err("Invalid port %s", arg);
+            return -1;
+        }
     } else if (address_port(listener->address) == 0 && is_numeric(arg)) {
-        address_set_port(listener->address, atoi(arg));
+        if (!address_set_port_str(listener->address, arg)) {
+            err("Invalid port %s", arg);
+            return -1;
+        }
     } else {
         err("Invalid listener argument %s", arg);
     }
@@ -231,17 +265,22 @@ accept_listener_arg(struct Listener *listener, char *arg) {
 }
 
 int
-accept_listener_table_name(struct Listener *listener, char *table_name) {
-    if (listener->table_name == NULL)
-        listener->table_name = strdup(table_name);
-    else
-        err("Duplicate table_name: %s", table_name);
+accept_listener_table_name(struct Listener *listener, const char *table_name) {
+    if (listener->table_name != NULL) {
+        err("Duplicate table: %s", table_name);
+        return 0;
+    }
+    listener->table_name = strdup(table_name);
+    if (listener->table_name == NULL) {
+        err("%s: strdup", __func__);
+        return -1;
+    }
 
     return 1;
 }
 
 int
-accept_listener_protocol(struct Listener *listener, char *protocol) {
+accept_listener_protocol(struct Listener *listener, const char *protocol) {
     if (strncasecmp(protocol, http_protocol->name, strlen(protocol)) == 0)
         listener->protocol = http_protocol;
     else
@@ -254,47 +293,96 @@ accept_listener_protocol(struct Listener *listener, char *protocol) {
 }
 
 int
-accept_listener_fallback_address(struct Listener *listener, char *fallback) {
-    if (listener->fallback_address != NULL) {
-        err("Duplicate fallback address: %s", fallback);
+accept_listener_reuseport(struct Listener *listener, const char *reuseport) {
+    listener->reuseport = parse_boolean(reuseport);
+    if (listener->reuseport == -1) {
         return 0;
     }
-    struct Address *fallback_address = new_address(fallback);
-    if (fallback_address == NULL) {
-        err("Unable to parse fallback address: %s", fallback);
+
+#ifndef SO_REUSEPORT
+    if (listener->reuseport == 1) {
+        err("Reuseport not supported in this build");
         return 0;
-    } else if (address_is_sockaddr(fallback_address)) {
-        listener->fallback_address = fallback_address;
-        return 1;
-    } else if (address_is_hostname(fallback_address)) {
-#ifndef HAVE_LIBUDNS
-        err("Only fallback socket addresses permitted when compiled without libudns");
-        free(fallback_address);
-        return 0;
-#else
-        warn("Using hostname as fallback address is strongly discouraged");
-        listener->fallback_address = fallback_address;
-        return 1;
+    }
 #endif
-    } else if (address_is_wildcard(fallback_address)) {
-        /* The wildcard functionality requires successfully parsing the
-         * hostname from the client's request, if we couldn't find the
-         * hostname and are using a fallback address it doesn't make
-         * much sense to configure it as a wildcard. */
-        err("Wildcard address prohibited as fallback address");
-        free(fallback_address);
+
+    return 1;
+}
+
+int
+accept_listener_ipv6_v6only(struct Listener *listener, const char *ipv6_v6only) {
+    listener->ipv6_v6only = parse_boolean(ipv6_v6only);
+    if (listener->ipv6_v6only == -1) {
         return 0;
+    }
+
+#ifndef IPV6_V6ONLY
+    if (listener->ipv6_v6only == 1) {
+        err("IPV6_V6ONLY not supported in this build");
+        return 0;
+    }
+#endif
+
+    return 1;
+}
+
+int
+accept_listener_fallback_address(struct Listener *listener, const char *fallback) {
+    if (listener->fallback_address == NULL) {
+        struct Address *fallback_address = new_address(fallback);
+        if (fallback_address == NULL) {
+            err("Unable to parse fallback address: %s", fallback);
+            return 0;
+        } else if (address_is_sockaddr(fallback_address)) {
+            listener->fallback_address = fallback_address;
+            return 1;
+        } else if (address_is_hostname(fallback_address)) {
+#ifndef HAVE_LIBUDNS
+            err("Only fallback socket addresses permitted when compiled without libudns");
+            free(fallback_address);
+            return 0;
+#else
+            warn("Using hostname as fallback address is strongly discouraged");
+            listener->fallback_address = fallback_address;
+            return 1;
+#endif
+        } else if (address_is_wildcard(fallback_address)) {
+            /* The wildcard functionality requires successfully parsing the
+             * hostname from the client's request, if we couldn't find the
+             * hostname and are using a fallback address it doesn't make
+             * much sense to configure it as a wildcard. */
+            err("Wildcard address prohibited as fallback address");
+            free(fallback_address);
+            return 0;
+        } else {
+            fatal("Unexpected fallback address type");
+            return 0;
+        }
+    } else if (strcasecmp("proxy", fallback) == 0 &&
+            listener->fallback_use_proxy_header == 0) {
+        listener->fallback_use_proxy_header = 1;
+        return 1;
     } else {
-        fatal("Unexpected fallback address type");
+        err("Unexpected fallback argument: %s", fallback);
         return 0;
     }
 }
 
 int
-accept_listener_source_address(struct Listener *listener, char *source) {
-    if (listener->source_address != NULL) {
+accept_listener_source_address(struct Listener *listener, const char *source) {
+    if (listener->source_address != NULL || listener->transparent_proxy) {
         err("Duplicate source address: %s", source);
         return 0;
+    }
+
+    if (strcasecmp("client", source) == 0) {
+#ifdef IP_TRANSPARENT
+        listener->transparent_proxy = 1;
+        return 1;
+#else
+        err("Transparent proxy not supported on this platform.");
+        return 0;
+#endif
     }
 
     listener->source_address = new_address(source);
@@ -319,7 +407,7 @@ accept_listener_source_address(struct Listener *listener, char *source) {
 }
 
 int
-accept_listener_bad_request_action(struct Listener *listener, char *action) {
+accept_listener_bad_request_action(struct Listener *listener, const char *action) {
     if (strncmp("log", action, strlen(action)) == 0) {
         listener->log_bad_requests = 1;
     }
@@ -355,13 +443,18 @@ add_listener(struct Listener_head *listeners, struct Listener *listener) {
 
 void
 remove_listener(struct Listener_head *listeners, struct Listener *listener, struct ev_loop *loop) {
-    SLIST_REMOVE(listeners, listener, Listener, entries);
     close_listener(loop, listener);
+    SLIST_REMOVE(listeners, listener, Listener, entries);
     listener_ref_put(listener);
 }
 
 int
 valid_listener(const struct Listener *listener) {
+    if (listener->accept_cb == NULL) {
+        err("No accept callback not specified");
+        return 0;
+    }
+
     if (listener->address == NULL) {
         err("No address specified");
         return 0;
@@ -397,7 +490,8 @@ valid_listener(const struct Listener *listener) {
 }
 
 static int
-init_listener(struct Listener *listener, const struct Table_head *tables, struct ev_loop *loop) {
+init_listener(struct Listener *listener, const struct Table_head *tables,
+        struct ev_loop *loop) {
     char address[ADDRESS_BUFFER_SIZE];
     struct Table *table = table_lookup(tables, listener->table_name);
     if (table == NULL) {
@@ -414,17 +508,66 @@ init_listener(struct Listener *listener, const struct Table_head *tables, struct
         address_set_port(listener->fallback_address,
                 address_port(listener->address));
 
+#ifdef HAVE_ACCEPT4
+    int sockfd = socket(address_sa(listener->address)->sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+#else
     int sockfd = socket(address_sa(listener->address)->sa_family, SOCK_STREAM, 0);
+#endif
     if (sockfd < 0) {
         err("socket failed: %s", strerror(errno));
-        return -2;
+        return sockfd;
     }
 
     /* set SO_REUSEADDR on server socket to facilitate restart */
     int on = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    int result = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (result < 0) {
+        err("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
+        close(sockfd);
+        return result;
+    }
 
-    int result = bind(sockfd, address_sa(listener->address),
+    /* set SO_KEEPALIVE on the server socket so that abandoned client connections
+     * do not linger behind forever */
+    result = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    if (result < 0) {
+        err("setsockopt SO_KEEPALIVE failed: %s", strerror(errno));
+        close(sockfd);
+        return result;
+    }
+
+    if (listener->reuseport == 1) {
+#ifdef SO_REUSEPORT
+        /* set SO_REUSEPORT on server socket to allow binding of multiple
+         * processes on the same ip:port */
+        result = setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#else
+        result = -ENOSYS;
+#endif
+        if (result < 0) {
+            err("setsockopt SO_REUSEPORT failed: %s", strerror(errno));
+            close(sockfd);
+            return result;
+        }
+    }
+
+    if (listener->ipv6_v6only == 1 &&
+            address_sa(listener->address)->sa_family == AF_INET6) {
+#ifdef IPV6_V6ONLY
+        /* set IPV6_V6ONLY on server socket to only accept IPv6 connections on
+         * IPv6 listeners */
+        result = setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+#else
+        result = -ENOSYS;
+#endif
+        if (result < 0) {
+            err("setsockopt IPV6_V6ONLY failed: %s", strerror(errno));
+            close(sockfd);
+            return result;
+        }
+    }
+
+    result = bind(sockfd, address_sa(listener->address),
             address_sa_len(listener->address));
     if (result < 0 && errno == EACCES) {
         /* Retry using binder module */
@@ -434,28 +577,28 @@ init_listener(struct Listener *listener, const struct Table_head *tables, struct
         if (sockfd < 0) {
             err("binder failed to bind to %s",
                 display_address(listener->address, address, sizeof(address)));
-            close(sockfd);
-            return -3;
+            return sockfd;
         }
     } else if (result < 0) {
         err("bind %s failed: %s",
             display_address(listener->address, address, sizeof(address)),
             strerror(errno));
         close(sockfd);
-        return -3;
+        return result;
     }
 
-    if (listen(sockfd, SOMAXCONN) < 0) {
+    result = listen(sockfd, SOMAXCONN);
+    if (result < 0) {
         err("listen failed: %s", strerror(errno));
         close(sockfd);
-        return -4;
+        return result;
     }
 
-
+#ifndef HAVE_ACCEPT4
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
-    listener_ref_get(listener);
     ev_io_init(&listener->watcher, accept_cb, sockfd, EV_READ);
     listener->watcher.data = listener;
     listener->backoff_timer.data = listener;
@@ -472,51 +615,67 @@ init_listener(struct Listener *listener, const struct Table_head *tables, struct
  *         address based on the request hostname (if valid)
  *      3. use the fallback address
  */
-struct Address *
+struct LookupResult
 listener_lookup_server_address(const struct Listener *listener,
         const char *name, size_t name_len) {
-    const struct Address *addr =
+    struct LookupResult table_result =
         table_lookup_server_address(listener->table, name, name_len);
-    if (addr == NULL) {
-        if (listener->fallback_address)
-            addr = listener->fallback_address;
-        else
-            return NULL;
-    }
 
-    struct Address *new_addr = NULL;
-
-    if (address_is_wildcard(addr)) {
-        new_addr = new_address(name);
+    if (table_result.address == NULL) {
+        /* No match in table, use fallback address if present */
+        return (struct LookupResult){
+            .address = listener->fallback_address,
+            .use_proxy_header = listener->fallback_use_proxy_header
+        };
+    } else if (address_is_wildcard(table_result.address)) {
+        /* Wildcard table entry, create a new address from hostname */
+        struct Address *new_addr = new_address(name);
         if (new_addr == NULL) {
             warn("Invalid hostname %.*s in client request",
                     (int)name_len, name);
+
+            return (struct LookupResult){
+                .address = listener->fallback_address,
+                .use_proxy_header = listener->fallback_use_proxy_header
+            };
         } else if (address_is_sockaddr(new_addr)) {
             warn("Refusing to proxy to socket address literal %.*s in request",
                     (int)name_len, name);
-
             free(new_addr);
-            new_addr = NULL;
-        } else if (address_port(addr) != 0) {
-            /* We created a valid new_addr,
-             * use the port from wildcard address if present */
-            address_set_port(new_addr, address_port(addr));
+
+            return (struct LookupResult){
+                .address = listener->fallback_address,
+                .use_proxy_header = listener->fallback_use_proxy_header
+            };
         }
+
+        /* We created a valid new_addr, use the port from wildcard address if
+         * present otherwise the listener */
+        address_set_port(new_addr, address_port(table_result.address) != 0 ?
+                                   address_port(table_result.address) :
+                                   address_port(listener->address));
+
+
+        return (struct LookupResult){
+            .address = new_addr,
+            .caller_free_address = 1,
+            .use_proxy_header = table_result.use_proxy_header
+        };
+    } else if (address_port(table_result.address) == 0) {
+        /* If the server port isn't specified return a new address using the
+         * port from the listen, this allows sharing table across listeners */
+        struct Address *new_addr = copy_address(table_result.address);
+
+        address_set_port(new_addr, address_port(listener->address));
+
+        return (struct LookupResult){
+            .address = new_addr,
+            .caller_free_address = 1,
+            .use_proxy_header = table_result.use_proxy_header
+        };
     } else {
-        new_addr = copy_address(addr);
+        return table_result;
     }
-
-    if (new_addr == NULL && listener->fallback_address)
-        new_addr = copy_address(listener->fallback_address);
-
-    if (new_addr) {
-        /* we successfully allocate a new address,
-         * use the listeners port if we don't have one already */
-        if (address_port(new_addr) == 0)
-            address_set_port(new_addr, address_port(listener->address));
-    }
-
-    return new_addr;
 }
 
 void
@@ -531,8 +690,15 @@ print_listener_config(FILE *file, const struct Listener *listener) {
     if (listener->table_name)
         fprintf(file, "\ttable %s\n", listener->table_name);
 
-    if (listener->fallback_address)
+    if (listener->fallback_address &&
+            !listener->fallback_use_proxy_header)
         fprintf(file, "\tfallback %s\n",
+                display_address(listener->fallback_address,
+                    address, sizeof(address)));
+
+    if (listener->fallback_address &&
+            listener->fallback_use_proxy_header)
+        fprintf(file, "\tfallback %s proxy\n",
                 display_address(listener->fallback_address,
                     address, sizeof(address)));
 
@@ -541,18 +707,21 @@ print_listener_config(FILE *file, const struct Listener *listener) {
                 display_address(listener->source_address,
                     address, sizeof(address)));
 
+    if (listener->reuseport)
+        fprintf(file, "\treuseport on\n");
+
     fprintf(file, "}\n\n");
 }
 
 static void
 close_listener(struct ev_loop *loop, struct Listener *listener) {
-    if (listener->watcher.fd < 0)
-        return;
-
     ev_timer_stop(loop, &listener->backoff_timer);
-    ev_io_stop(loop, &listener->watcher);
-    close(listener->watcher.fd);
-    listener_ref_put(listener);
+
+    if (listener->watcher.fd >= 0) {
+        ev_io_stop(loop, &listener->watcher);
+        close(listener->watcher.fd);
+        listener->watcher.fd = -1;
+    }
 }
 
 static void
@@ -591,9 +760,8 @@ free_listeners(struct Listener_head *listeners, struct ev_loop *loop) {
  * listeners list in the active configuration, and free them when their last
  * connection closes.
  *
- * Accomplishing this with reference counting, each connection counts as a one
- * reference, plus one for the active EV watchers and one for the listener
- * being a member on a configurations listeners list.
+ * Accomplishing this with reference counting: membership in a Config listener
+ * list counts as one as does each connection.
  */
 void
 listener_ref_put(struct Listener *listener) {
@@ -617,7 +785,7 @@ accept_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
     struct Listener *listener = (struct Listener *)w->data;
 
     if (revents & EV_READ) {
-        int result = accept_connection(listener, loop);
+        int result = listener->accept_cb(listener, loop);
         if (result == 0 && (errno == EMFILE || errno == ENFILE)) {
             char address_buf[ADDRESS_BUFFER_SIZE];
             int backoff_time = 2;

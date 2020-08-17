@@ -25,6 +25,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
@@ -38,11 +39,6 @@
 #include <arpa/inet.h>
 #include <ev.h>
 #include <assert.h>
-
-#ifdef HAVE_ALLOCA_H
-#include <alloca.h>
-#endif
-
 #include "connection.h"
 #include "resolv.h"
 #include "address.h"
@@ -53,12 +49,14 @@
 #define IS_TEMPORARY_SOCKERR(_errno) (_errno == EAGAIN || \
                                       _errno == EWOULDBLOCK || \
                                       _errno == EINTR)
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 
 struct resolv_cb_data {
     struct Connection *connection;
-    struct Address *address;
+    const struct Address *address;
     struct ev_loop *loop;
+    int cb_free_addr;
 };
 
 
@@ -74,6 +72,7 @@ static void reactivate_watcher(struct ev_loop *, struct ev_io *,
 static void connection_cb(struct ev_loop *, struct ev_io *, int);
 static void resolv_cb(struct Address *, void *);
 static void reactivate_watchers(struct Connection *, struct ev_loop *);
+static void insert_proxy_v1_header(struct Connection *);
 static void parse_client_request(struct Connection *);
 static void resolve_server_address(struct Connection *, struct ev_loop *);
 static void initiate_server_connect(struct Connection *, struct ev_loop *);
@@ -106,10 +105,18 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
         err("new_connection failed");
         return 0;
     }
+    con->listener = listener_ref_get(listener);
 
+#ifdef HAVE_ACCEPT4
+    int sockfd = accept4(listener->watcher.fd,
+                    (struct sockaddr *)&con->client.addr,
+                    &con->client.addr_len,
+                    SOCK_NONBLOCK);
+#else
     int sockfd = accept(listener->watcher.fd,
                     (struct sockaddr *)&con->client.addr,
                     &con->client.addr_len);
+#endif
     if (sockfd < 0) {
         int saved_errno = errno;
 
@@ -120,20 +127,36 @@ accept_connection(struct Listener *listener, struct ev_loop *loop) {
         return 0;
     }
 
+#ifndef HAVE_ACCEPT4
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    if (getsockname(sockfd, (struct sockaddr *)&con->client.local_addr,
+                &con->client.local_addr_len) != 0) {
+        int saved_errno = errno;
+
+        warn("getsockname failed: %s", strerror(errno));
+        free_connection(con);
+
+        errno = saved_errno;
+        return 0;
+    }
 
     /* Avoiding type-punned pointer warning */
     struct ev_io *client_watcher = &con->client.watcher;
     ev_io_init(client_watcher, connection_cb, sockfd, EV_READ);
     con->client.watcher.data = con;
     con->state = ACCEPTED;
-    con->listener = listener_ref_get(listener);
     con->established_timestamp = ev_now(loop);
 
     TAILQ_INSERT_HEAD(&connections, con, entries);
 
     ev_io_start(loop, client_watcher);
+
+    if (con->listener->table->use_proxy_header ||
+            con->listener->fallback_use_proxy_header)
+        insert_proxy_v1_header(con);
 
     return 1;
 }
@@ -218,6 +241,8 @@ static void
 connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
     struct Connection *con = (struct Connection *)w->data;
     int is_client = &con->client.watcher == w;
+    const char *socket_name =
+        is_client ? "client" : "server";
     struct Buffer *input_buffer =
         is_client ? con->client.buffer : con->server.buffer;
     struct Buffer *output_buffer =
@@ -229,7 +254,8 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
     if (revents & EV_READ && buffer_room(input_buffer)) {
         ssize_t bytes_received = buffer_recv(input_buffer, w->fd, 0, loop);
         if (bytes_received < 0 && !IS_TEMPORARY_SOCKERR(errno)) {
-            warn("recv(): %s, closing connection",
+            warn("recv(%s): %s, closing connection",
+                    socket_name,
                     strerror(errno));
 
             close_socket(con, loop);
@@ -244,14 +270,16 @@ connection_cb(struct ev_loop *loop, struct ev_io *w, int revents) {
     if (revents & EV_WRITE && buffer_len(output_buffer)) {
         ssize_t bytes_transmitted = buffer_send(output_buffer, w->fd, 0, loop);
         if (bytes_transmitted < 0 && !IS_TEMPORARY_SOCKERR(errno)) {
-            warn("send(): %s, closing connection",
+            warn("send(%s): %s, closing connection",
+                    socket_name,
                     strerror(errno));
 
             close_socket(con, loop);
         }
     }
 
-    /* Handle any state specific logic */
+    /* Handle any state specific logic, note we may transition through several
+     * states during a single call */
     if (is_client && con->state == ACCEPTED)
         parse_client_request(con);
     if (is_client && con->state == PARSED)
@@ -334,10 +362,86 @@ reactivate_watcher(struct ev_loop *loop, struct ev_io *w,
 }
 
 static void
+insert_proxy_v1_header(struct Connection *con) {
+    char buf[INET6_ADDRSTRLEN] = { '\0' };
+    size_t buf_len;
+
+    con->header_len += buffer_push(con->client.buffer, "PROXY ", 6);
+
+    switch (con->client.addr.ss_family) {
+        case AF_INET:
+            con->header_len += buffer_push(con->client.buffer, "TCP4 ", 5);
+
+            inet_ntop(AF_INET,
+                      &((const struct sockaddr_in *)&con->client.addr)->
+                      sin_addr, buf, sizeof(buf));
+            buf_len = strlen(buf);
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            con->header_len += buffer_push(con->client.buffer, " ", 1);
+
+            inet_ntop(AF_INET,
+                      &((const struct sockaddr_in *)&con->client.local_addr)->
+                      sin_addr, buf, sizeof(buf));
+            buf_len = strlen(buf);
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
+                              ntohs(((const struct sockaddr_in *)&con->
+                              client.addr)->sin_port));
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
+                              ntohs(((const struct sockaddr_in *)&con->
+                              client.local_addr)->sin_port));
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            break;
+        case AF_INET6:
+            con->header_len += buffer_push(con->client.buffer, "TCP6 ", 5);
+            inet_ntop(AF_INET6,
+                    &((const struct sockaddr_in6 *)&con->client.addr)->
+                    sin6_addr, buf, sizeof(buf));
+            buf_len = strlen(buf);
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            con->header_len += buffer_push(con->client.buffer, " ", 1);
+
+            inet_ntop(AF_INET6,
+                      &((const struct sockaddr_in6 *)&con->
+                      client.local_addr)->sin6_addr, buf, sizeof(buf));
+            buf_len = strlen(buf);
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
+                              ntohs(((const struct sockaddr_in6 *)&con->
+                              client.addr)->sin6_port));
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            buf_len = snprintf(buf, sizeof(buf), " %" PRIu16,
+                              ntohs(((const struct sockaddr_in6 *)&con->
+                              client.local_addr)->sin6_port));
+            con->header_len += buffer_push(con->client.buffer, buf, buf_len);
+
+            break;
+        default:
+            con->header_len += buffer_push(con->client.buffer, "UNKNOWN", 7);
+    }
+    con->header_len += buffer_push(con->client.buffer, "\r\n", 2);
+}
+
+static void
 parse_client_request(struct Connection *con) {
     const char *payload;
-    ssize_t payload_len = buffer_coalesce(con->client.buffer, (const void **)&payload);
+    size_t payload_len = buffer_coalesce(con->client.buffer, (const void **)&payload);
     char *hostname = NULL;
+
+    /* Avoid payload_len underflow and empty request */
+    if (payload_len <= con->header_len)
+        return;
+
+    payload += con->header_len;
+    payload_len -= con->header_len;
 
     int result = con->listener->protocol->parse_packet(payload, payload_len, &hostname);
     if (result < 0) {
@@ -347,7 +451,7 @@ parse_client_request(struct Connection *con) {
             if (buffer_room(con->client.buffer) > 0)
                 return; /* give client a chance to send more data */
 
-            warn("Request from %s exceeded %ld byte buffer size",
+            warn("Request from %s exceeded %zu byte buffer size",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
                     buffer_size(con->client.buffer));
         } else if (result == -2) {
@@ -369,7 +473,7 @@ parse_client_request(struct Connection *con) {
     }
 
     con->hostname = hostname;
-    con->hostname_len = result;
+    con->hostname_len = (size_t)result;
     con->state = PARSED;
 }
 
@@ -386,43 +490,74 @@ abort_connection(struct Connection *con) {
 
 static void
 resolve_server_address(struct Connection *con, struct ev_loop *loop) {
-    /* TODO avoid extra malloc in listener_lookup_server_address() */
-    struct Address *server_address =
+    struct LookupResult result =
         listener_lookup_server_address(con->listener, con->hostname, con->hostname_len);
 
-    if (server_address == NULL) {
+    if (result.address == NULL) {
         abort_connection(con);
         return;
-    } else if (address_is_hostname(server_address)) {
+    } else if (address_is_hostname(result.address)) {
 #ifndef HAVE_LIBUDNS
         warn("DNS lookups not supported unless sniproxy compiled with libudns");
-        free(server_address);
+
+        if (result.caller_free_address)
+            free((void *)result.address);
+
         abort_connection(con);
         return;
 #else
         struct resolv_cb_data *cb_data = malloc(sizeof(struct resolv_cb_data));
         if (cb_data == NULL) {
             err("%s: malloc", __func__);
-            free(server_address);
+
+            if (result.caller_free_address)
+                free((void *)result.address);
+
             abort_connection(con);
             return;
         }
         cb_data->connection = con;
-        cb_data->address = server_address;
+        cb_data->address = result.address;
+        cb_data->cb_free_addr = result.caller_free_address;
         cb_data->loop = loop;
+        con->use_proxy_header = result.use_proxy_header;
 
-        con->query_handle = resolv_query(address_hostname(server_address),
-                resolv_cb, (void (*)(void *))free_resolv_cb_data, cb_data);
+        int resolv_mode = RESOLV_MODE_DEFAULT;
+        if (con->listener->transparent_proxy) {
+            char listener_address[ADDRESS_BUFFER_SIZE];
+            switch (con->client.addr.ss_family) {
+                case AF_INET:
+                    resolv_mode = RESOLV_MODE_IPV4_ONLY;
+                    break;
+                case AF_INET6:
+                    resolv_mode = RESOLV_MODE_IPV6_ONLY;
+                    break;
+                default:
+                    warn("attempt to use transparent proxy with hostname %s "
+                            "on non-IP listener %s, falling back to "
+                            "non-transparent mode",
+                            address_hostname(result.address),
+                            display_sockaddr(con->listener->address,
+                                    listener_address, sizeof(listener_address))
+                            );
+            }
+        }
+
+        con->query_handle = resolv_query(address_hostname(result.address),
+                resolv_mode, resolv_cb,
+                (void (*)(void *))free_resolv_cb_data, cb_data);
 
         con->state = RESOLVING;
 #endif
-    } else if (address_is_sockaddr(server_address)) {
-        con->server.addr_len = address_sa_len(server_address);
+    } else if (address_is_sockaddr(result.address)) {
+        con->server.addr_len = address_sa_len(result.address);
         assert(con->server.addr_len <= sizeof(con->server.addr));
-        memcpy(&con->server.addr, address_sa(server_address),
+        memcpy(&con->server.addr, address_sa(result.address),
             con->server.addr_len);
+        con->use_proxy_header = result.use_proxy_header;
 
-        free(server_address);
+        if (result.caller_free_address)
+            free((void *)result.address);
 
         con->state = RESOLVED;
     } else {
@@ -438,7 +573,7 @@ resolv_cb(struct Address *result, void *data) {
     struct ev_loop *loop = cb_data->loop;
 
     if (con->state != RESOLVING) {
-        info("resolv_cb() called for connection not in RESOLVING state");
+        warn("resolv_cb() called for connection not in RESOLVING state");
         return;
     }
 
@@ -467,13 +602,18 @@ resolv_cb(struct Address *result, void *data) {
 
 static void
 free_resolv_cb_data(struct resolv_cb_data *cb_data) {
-    free(cb_data->address);
+    if (cb_data->cb_free_addr)
+        free((void *)cb_data->address);
     free(cb_data);
 }
 
 static void
 initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
+#ifdef HAVE_ACCEPT4
+    int sockfd = socket(con->server.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+#else
     int sockfd = socket(con->server.addr.ss_family, SOCK_STREAM, 0);
+#endif
     if (sockfd < 0) {
         char client[INET6_ADDRSTRLEN + 8];
         warn("socket failed: %s, closing connection from %s",
@@ -483,14 +623,46 @@ initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
         return;
     }
 
+#ifndef HAVE_ACCEPT4
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+#endif
 
-    if (con->listener->source_address) {
+    if (con->listener->transparent_proxy &&
+            con->client.addr.ss_family == con->server.addr.ss_family) {
+#ifdef IP_TRANSPARENT
         int on = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        int result = setsockopt(sockfd, SOL_IP, IP_TRANSPARENT, &on, sizeof(on));
+#else
+        int result = -EPERM;
+        /* XXX error: not implemented would be better, but this shouldn't be
+         * reached since it is prohibited in the configuration parser. */
+#endif
+        if (result < 0) {
+            err("setsockopt IP_TRANSPARENT failed: %s", strerror(errno));
+            close(sockfd);
+            abort_connection(con);
+            return;
+        }
 
-        int result = 0;
+        result = bind(sockfd, (struct sockaddr *)&con->client.addr,
+                con->client.addr_len);
+        if (result < 0) {
+            err("bind failed: %s", strerror(errno));
+            close(sockfd);
+            abort_connection(con);
+            return;
+        }
+    } else if (con->listener->source_address) {
+        int on = 1;
+        int result = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if (result < 0) {
+            err("setsockopt SO_REUSEADDR failed: %s", strerror(errno));
+            close(sockfd);
+            abort_connection(con);
+            return;
+        }
+
         int tries = 5;
         do {
             result = bind(sockfd,
@@ -520,6 +692,21 @@ initiate_server_connect(struct Connection *con, struct ev_loop *loop) {
                 strerror(errno));
         abort_connection(con);
         return;
+    }
+
+    if (getsockname(sockfd, (struct sockaddr *)&con->server.local_addr,
+                &con->server.local_addr_len) != 0) {
+        close(sockfd);
+        warn("getsockname failed: %s", strerror(errno));
+
+        abort_connection(con);
+        return;
+    }
+
+    if (con->header_len && !con->use_proxy_header) {
+        /* If we prepended the PROXY header and this backend isn't configured
+         * to receive it, consume it now */
+        buffer_pop(con->client.buffer, NULL, con->header_len);
     }
 
     struct ev_io *server_watcher = &con->server.watcher;
@@ -583,8 +770,7 @@ static void
 close_connection(struct Connection *con, struct ev_loop *loop) {
     assert(con->state != NEW); /* only used during initialization */
 
-    if (con->state == CONNECTED
-            || con->state == CLIENT_CLOSED)
+    if (server_socket_open(con))
         close_server_socket(con, loop);
 
     assert(con->state == ACCEPTED
@@ -594,11 +780,7 @@ close_connection(struct Connection *con, struct ev_loop *loop) {
             || con->state == SERVER_CLOSED
             || con->state == CLOSED);
 
-    if (con->state == ACCEPTED
-            || con->state == PARSED
-            || con->state == RESOLVING
-            || con->state == RESOLVED
-            || con->state == SERVER_CLOSED)
+    if (client_socket_open(con))
         close_client_socket(con, loop);
 
     assert(con->state == CLOSED);
@@ -615,10 +797,16 @@ new_connection(struct ev_loop *loop) {
 
     con->state = NEW;
     con->client.addr_len = sizeof(con->client.addr);
+    con->client.local_addr = (struct sockaddr_storage){.ss_family = AF_UNSPEC};
+    con->client.local_addr_len = sizeof(con->client.local_addr);
     con->server.addr_len = sizeof(con->server.addr);
+    con->server.local_addr = (struct sockaddr_storage){.ss_family = AF_UNSPEC};
+    con->server.local_addr_len = sizeof(con->server.local_addr);
     con->hostname = NULL;
     con->hostname_len = 0;
+    con->header_len = 0;
     con->query_handle = NULL;
+    con->use_proxy_header = 0;
 
     con->client.buffer = new_buffer(4096, loop);
     if (con->client.buffer == NULL) {
@@ -637,23 +825,21 @@ new_connection(struct ev_loop *loop) {
 
 static void
 log_connection(struct Connection *con) {
-    ev_tstamp duration;
+    ev_tstamp duration = MAX(con->client.buffer->last_recv,
+                             con->server.buffer->last_recv) -
+                         con->established_timestamp;
     char client_address[ADDRESS_BUFFER_SIZE];
     char listener_address[ADDRESS_BUFFER_SIZE];
     char server_address[ADDRESS_BUFFER_SIZE];
 
-    if (con->client.buffer->last_recv > con->server.buffer->last_recv)
-        duration = con->client.buffer->last_recv - con->established_timestamp;
-    else
-        duration = con->server.buffer->last_recv - con->established_timestamp;
 
     display_sockaddr(&con->client.addr, client_address, sizeof(client_address));
-    display_address(con->listener->address, listener_address, sizeof(listener_address));
+    display_sockaddr(&con->client.local_addr, listener_address, sizeof(listener_address));
     display_sockaddr(&con->server.addr, server_address, sizeof(server_address));
 
     log_msg(con->listener->access_log,
            LOG_NOTICE,
-           "%s -> %s -> %s [%.*s] %ld/%ld bytes tx %ld/%ld bytes rx %1.3f seconds",
+           "%s -> %s -> %s [%.*s] %zu/%zu bytes tx %zu/%zu bytes rx %1.3f seconds",
            client_address,
            listener_address,
            server_address,
@@ -669,21 +855,27 @@ log_connection(struct Connection *con) {
 static void
 log_bad_request(struct Connection *con __attribute__((unused)), const char *req, size_t req_len, int parse_result) {
     size_t message_len = 64 + 6 * req_len;
-    char *message = alloca(message_len);
+    char *message = malloc(message_len);
+    if (message == NULL) {
+        err("log_bad_request: unable to allocate message buffer");
+        return;
+    }
     char *message_pos = message;
     char *message_end = message + message_len;
 
-    message_pos += snprintf(message_pos, message_end - message_pos,
+    message_pos += snprintf(message_pos, (size_t)(message_end - message_pos),
                             "parse_packet({");
 
     for (size_t i = 0; i < req_len; i++)
-        message_pos += snprintf(message_pos, message_end - message_pos,
+        message_pos += snprintf(message_pos, (size_t)(message_end - message_pos),
                                 "0x%02hhx, ", (unsigned char)req[i]);
 
     message_pos -= 2;/* Delete the trailing ', ' */
-    message_pos += snprintf(message_pos, message_end - message_pos,
-                            "}, %ld, ...) = %d", req_len, parse_result);
+    snprintf(message_pos, (size_t)(message_end - message_pos), "}, %zu, ...) = %d",
+             req_len, parse_result);
     debug("%s", message);
+
+    free(message);
 }
 
 /*
@@ -715,39 +907,39 @@ print_connection(FILE *file, const struct Connection *con) {
         case ACCEPTED:
             fprintf(file, "ACCEPTED      %s %zu/%zu\t-\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size);
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer));
             break;
         case PARSED:
             fprintf(file, "PARSED        %s %zu/%zu\t-\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size);
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer));
             break;
         case RESOLVING:
             fprintf(file, "RESOLVING      %s %zu/%zu\t-\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size);
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer));
             break;
         case RESOLVED:
             fprintf(file, "RESOLVED      %s %zu/%zu\t-\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size);
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer));
             break;
         case CONNECTED:
             fprintf(file, "CONNECTED     %s %zu/%zu\t%s %zu/%zu\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size,
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer),
                     display_sockaddr(&con->server.addr, server, sizeof(server)),
-                    con->server.buffer->len, con->server.buffer->size);
+                    buffer_len(con->server.buffer), buffer_size(con->server.buffer));
             break;
         case SERVER_CLOSED:
             fprintf(file, "SERVER_CLOSED %s %zu/%zu\t-\n",
                     display_sockaddr(&con->client.addr, client, sizeof(client)),
-                    con->client.buffer->len, con->client.buffer->size);
+                    buffer_len(con->client.buffer), buffer_size(con->client.buffer));
             break;
         case CLIENT_CLOSED:
             fprintf(file, "CLIENT_CLOSED -\t%s %zu/%zu\n",
                     display_sockaddr(&con->server.addr, server, sizeof(server)),
-                    con->server.buffer->len, con->server.buffer->size);
+                    buffer_len(con->server.buffer), buffer_size(con->server.buffer));
             break;
         case CLOSED:
             fprintf(file, "CLOSED        -\t-\n");

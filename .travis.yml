@@ -8,9 +8,10 @@ install:
   - mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
   - ./autogen.sh
 script:
-  - echo "Running unit tests"
+  - echo "Running unit and functional tests"
   - ./configure
-  - make all check
+  - make all check CFLAGS=-Werror
+  - bash -c "cd tests && sudo ./transparent_proxy_test"
   - echo "Checking for memory leaks"
   - bash -c "cd tests && ./bad_dns_request_test valgrind --leak-check=full --error-exitcode=1"
   - bash -c "cd tests && ./bad_request_test valgrind --leak-check=full --error-exitcode=1"
@@ -21,6 +22,7 @@ script:
   - bash -c "cd tests && ./wildcard_test valgrind --leak-check=full --error-exitcode=1"
   - bash -c "cd tests && ./bind_source_test valgrind --leak-check=full --error-exitcode=1"
   - bash -c "cd tests && ./reload_test valgrind --leak-check=full --error-exitcode=1"
+  - bash -c "cd tests && ./proxy_header_test valgrind --leak-check=full --error-exitcode=1"
   - echo "Testing Debian package build"
   - dpkg-buildpackage -us -uc
   - echo "Testing RPM package build"
@@ -41,4 +43,4 @@ script:
   - sudo apt-get remove sniproxy
   - echo "Rebuilding without DNS and rerunning unit tests"
   - ./configure --disable-dns
-  - make clean all check
+  - make clean all check CFLAGS="-Werror -Wno-error=unused-function -Wno-error=unused-parameter"

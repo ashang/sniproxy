@@ -39,24 +39,28 @@ struct Listener {
     const struct Protocol *protocol;
     char *table_name;
     struct Logger *access_log;
-    int log_bad_requests;
+    int log_bad_requests, reuseport, transparent_proxy, ipv6_v6only;
+    int fallback_use_proxy_header;
 
     /* Runtime fields */
     int reference_count;
     struct ev_io watcher;
     struct ev_timer backoff_timer;
     struct Table *table;
+    int (*accept_cb)(struct Listener *, struct ev_loop *);
     SLIST_ENTRY(Listener) entries;
 };
 
 
 struct Listener *new_listener();
-int accept_listener_arg(struct Listener *, char *);
-int accept_listener_table_name(struct Listener *, char *);
-int accept_listener_fallback_address(struct Listener *, char *);
-int accept_listener_source_address(struct Listener *, char *);
-int accept_listener_protocol(struct Listener *, char *);
-int accept_listener_bad_request_action(struct Listener *, char *);
+int accept_listener_arg(struct Listener *, const char *);
+int accept_listener_table_name(struct Listener *, const char *);
+int accept_listener_fallback_address(struct Listener *, const char *);
+int accept_listener_source_address(struct Listener *, const char *);
+int accept_listener_protocol(struct Listener *, const char *);
+int accept_listener_reuseport(struct Listener *, const char *);
+int accept_listener_ipv6_v6only(struct Listener *, const char *);
+int accept_listener_bad_request_action(struct Listener *, const char *);
 
 void add_listener(struct Listener_head *, struct Listener *);
 void init_listeners(struct Listener_head *, const struct Table_head *, struct ev_loop *);
@@ -65,11 +69,10 @@ void remove_listener(struct Listener_head *, struct Listener *, struct ev_loop *
 void free_listeners(struct Listener_head *, struct ev_loop *);
 
 int valid_listener(const struct Listener *);
-struct Address *listener_lookup_server_address(const struct Listener *,
+struct LookupResult listener_lookup_server_address(const struct Listener *,
         const char *, size_t);
 void print_listener_config(FILE *, const struct Listener *);
 void listener_ref_put(struct Listener *);
 struct Listener *listener_ref_get(struct Listener *);
-
 
 #endif

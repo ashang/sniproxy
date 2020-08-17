@@ -1,21 +1,26 @@
 AM_CPPFLAGS = -I$(top_srcdir)/src -g $(LIBEV_CFLAGS) $(LIBPCRE_CFLAGS) $(LIBUDNS_CFLAGS)
+AM_CFLAGS = -fno-strict-aliasing -Wall -Wextra -Wpedantic -Wwrite-strings
 
-TESTS = http_test \
-        tls_test \
+TESTS = address_test \
         buffer_test \
-        table_test \
-        address_test \
         cfg_tokenizer_test \
-        binder_test \
-        functional_test \
-        bad_request_test \
-        slow_client_test \
-		fallback_test \
-        reload_test \
-        connection_reset_test \
-        bind_source_test \
-        fd_limit_test
+        table_test \
+        http_test \
+        tls_test \
+        binder_test
 
+TESTS += functional_test \
+         bad_request_test \
+         bind_source_test \
+         connection_reset_test \
+         fallback_test \
+         fd_limit_test \
+         ipv6_v6only_test \
+         proxy_header_test \
+         reload_test \
+         reuseport_test \
+         slow_client_test \
+         transparent_proxy_test
 if DNS_ENABLED
   TESTS += config_test \
            resolv_test \
@@ -41,7 +46,7 @@ tls_test_SOURCES = tls_test.c \
 
 binder_test_SOURCES = binder_test.c \
                       ../src/binder.c \
-					  ../src/logger.c
+                      ../src/logger.c
 
 buffer_test_SOURCES = buffer_test.c \
                       ../src/buffer.c

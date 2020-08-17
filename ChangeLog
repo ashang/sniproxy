@@ -1,3 +1,18 @@
+2018-12-05  Dustin Lundquist <dustin@null-ptr.net>
+	0.6.0 Release
+
+	* PROXY v1 protocol support
+	* SO_REUSEPORT support on Linux 3.9 and later
+	* Listener ipv6_only directive to accept only IPv6 connections
+	* TCP keepalive
+
+2017-04-26  Dustin Lundquist <dustin@null-ptr.net>
+	0.5.0 Release
+
+	* Transparent proxy support
+	* Use accept4() on Linix
+	* Run as group specified in config
+
 2015-04-07  Dustin Lundquist <dustin@null-ptr.net>
 	0.4.0 release
 

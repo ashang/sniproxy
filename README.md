@@ -6,11 +6,6 @@ the initial request of the TCP session. This enables HTTPS name-based virtual
 hosting to separate backend servers without installing the private key on the
 proxy machine.
 
-News
-----
-
-First [user survey](https://docs.google.com/forms/d/1K9Wpm6dZqBl9w4vhx_t2sWhRvOeNbJ8n0DBzYOo6ILo/viewform), please take a moment to offer your input.
-
 Features
 --------
 + Name-based proxying of HTTPS without decrypting traffic. No keys or
@@ -19,6 +14,8 @@ Features
 + Supports IPv4, IPv6 and Unix domain sockets for both back end servers and
   listeners.
 + Supports multiple listening sockets per instance.
++ Supports HAProxy proxy protocol to propagate original source address to
+  backend servers.
 
 Usage
 -----
@@ -127,7 +124,8 @@ Configuration Syntax
     table TableName {
         # Match exact request hostnames
         example.com 192.0.2.10:4343
-        example.net [2001:DB8::1:10]:443
+        # If port is not specified the listener port will be used
+        example.net [2001:DB8::1:10]
         # Or use regular expression to match
         .*\\.com    [2001:DB8::1:11]:443
         # Combining regular expression and wildcard will resolve the hostname
@@ -145,19 +143,3 @@ build without UDNS, but these features will be unavailable.
 UDNS uses a single UDP socket for all queries, so it is recommended you use a
 local caching DNS resolver (with a single socket each DNS query is protected by
 spoofing by a single 16 bit query ID, which makes it relatively easy to spoof).
-
-UDNS is currently not available in Debian stable, but a package can be easily
-built from the Debian testing or Ubuntu source packages:
-
-    mkdir udns_packaging
-    cd udns_packaging
-    wget http://archive.ubuntu.com/ubuntu/pool/universe/u/udns/udns_0.4-1.dsc
-    wget http://archive.ubuntu.com/ubuntu/pool/universe/u/udns/udns_0.4.orig.tar.gz
-    wget http://archive.ubuntu.com/ubuntu/pool/universe/u/udns/udns_0.4-1.debian.tar.gz
-    tar xfz udns_0.4.orig.tar.gz
-    cd udns-0.4/
-    tar xfz ../udns_0.4-1.debian.tar.gz
-    dpkg-buildpackage
-    cd ..
-    sudo dpkg -i libudns-dev_0.4-1_amd64.deb libudns0_0.4-1_amd64.deb
-
